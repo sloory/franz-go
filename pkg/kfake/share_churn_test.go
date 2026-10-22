@@ -24,6 +24,8 @@ import (
 //   - TestShareFetchLeaderMoveHintHeals: control - the existing
 //     CurrentLeader hint path migrates without metadata; passes pre-fix
 //     and post-fix.
+//   - TestShareErrorDefaultLeaderNoMove: a partition error other than a
+//     leader error carries CurrentLeader 0/0 and must not move the cursor.
 //   - TestShareFetchTransportErrorTriggersMetadata:
 //     a dead broker (connection killed on every ShareFetch) must trigger
 //     a metadata refresh from the fetch backoff path, like the classic
@@ -197,6 +199,83 @@ type metadataCounter struct{ n atomic.Int32 }
 func (m *metadataCounter) OnBrokerWrite(_ kgo.BrokerMetadata, key int16, _ int, _, _ time.Duration, _ error) {
 	if key == int16(kmsg.Metadata) {
 		m.n.Add(1)
+	}
+}
+
+// TestShareErrorDefaultLeaderNoMove fails one ShareFetch and one renew
+// ShareAcknowledge on the leader, broker 1, with an error that is not a
+// leader error. Kafka leaves CurrentLeader at 0/0 for such errors; the
+// client must not move the cursor to broker 0.
+func TestShareErrorDefaultLeaderNoMove(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		key kmsg.Key
+		err *kerr.Error
+	}{
+		{kmsg.ShareFetch, kerr.KafkaStorageError},
+		{kmsg.ShareAcknowledge, kerr.InvalidRecordState},
+	} {
+		t.Run(tt.key.Name(), func(t *testing.T) {
+			t.Parallel()
+
+			topic := "share-default-leader-" + tt.key.Name()
+			group := topic + "-g"
+			c := newCluster(t,
+				NumBrokers(2),
+				SeedTopics(1, topic),
+				BrokerConfigs(map[string]string{
+					"group.share.heartbeat.interval.ms": "100",
+				}),
+			)
+			if err := c.MoveTopicPartition(topic, 0, 1); err != nil {
+				t.Fatal(err)
+			}
+			produceShareN(t, c, topic, group, 1)
+
+			ti := c.TopicInfo(topic)
+			broker0 := c.Fault(Fault{
+				Keys:    []kmsg.Key{kmsg.ShareFetch, kmsg.ShareAcknowledge},
+				Nodes:   []int32{0},
+				TopicID: ti.TopicID,
+				Observe: true,
+				Count:   -1,
+			})
+			injected := c.Fault(Fault{
+				Keys:       []kmsg.Key{tt.key},
+				Nodes:      []int32{1},
+				TopicID:    ti.TopicID,
+				Partitions: []int32{0},
+				Err:        tt.err,
+			})
+
+			cl := shareChurnConsumer(t, c, topic, group)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			var recs []*kgo.Record
+			for len(recs) == 0 && ctx.Err() == nil {
+				recs = cl.PollFetches(ctx).Records()
+			}
+			if len(recs) == 0 {
+				t.Fatal("no record consumed")
+			}
+			// Renew acks are always sent in a standalone ShareAcknowledge.
+			recs[0].Ack(kgo.AckRenew)
+			if err := cl.FlushAcks(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			produceN(t, c, topic, 1)
+			if got, _ := pollShareUntil(t, cl, 1, 10*time.Second, nil); got < 1 {
+				t.Fatal("consumption did not continue after the error")
+			}
+			if injected.Hits() == 0 {
+				t.Fatal("the partition error was never injected")
+			}
+			if n := broker0.Hits(); n > 0 {
+				t.Errorf("broker 0 received %d share requests for a partition it does not lead", n)
+			}
+		})
 	}
 }
 
