@@ -889,6 +889,9 @@ func (k *kip951move) maybeAddSharePartition(sc *shareConsumer, c *shareCursor, e
 	if int(c.partition) >= len(ps) || ps[c.partition].shareCursor != c {
 		return false
 	}
+	if ps[c.partition].leaderEpoch < 0 { // epochs unknown: let metadata move the cursor
+		return false
+	}
 	if epoch <= ps[c.partition].leaderEpoch { // as in maybeAddProducePartition
 		return false
 	}
